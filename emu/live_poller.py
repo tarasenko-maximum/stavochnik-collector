@@ -255,7 +255,23 @@ def run_poll(feeds: Feeds, con):
     return poll_id
 
 
+class _Stop(BaseException):
+    """Наследуем от BaseException, а не Exception: широкие `except Exception` в клиентах источников
+    (сетевые ошибки одного фида не должны валить весь опрос) не должны глотать сигнал остановки."""
+    pass
+
+
+def _on_sigterm(signum, frame):
+    # `timeout N cmd` (используется коллектором на GitHub Actions) убивает процесс через SIGTERM —
+    # без этого обработчика WAL-файл (state/live.db-wal) не сливается в основной .db перед смертью
+    # процесса, и выгруженная наружу база оказывается почти пустой (реальные данные остаются в -wal,
+    # который никуда не отправляется). Поднимаем исключение, чтобы дойти до чистого closedown ниже.
+    raise _Stop()
+
+
 def main():
+    import signal
+    signal.signal(signal.SIGTERM, _on_sigterm)
     ap = argparse.ArgumentParser()
     ap.add_argument("--once", action="store_true")
     ap.add_argument("--poll", type=int, default=POLL_SEC)
@@ -273,20 +289,28 @@ def main():
     awake = keep_awake()
     log(f"старт поллера: источники {','.join(sorted(feeds.sources))}, окно −{args.hours_back}h..+{args.hours_ahead}h, "
         f"шаг {args.poll}s, БД {ldb.DB_PATH}" + (" | сон системы заблокирован" if awake else ""))
-    while True:
-        t0 = time.time()
+    try:
+        while True:
+            t0 = time.time()
+            try:
+                run_poll(feeds, con)
+            except (KeyboardInterrupt, _Stop):
+                raise
+            except Exception:
+                log("ошибка опроса:\n" + traceback.format_exc())
+            if args.once:
+                break
+            wait = args.poll - (time.time() - t0)
+            if wait > 0:
+                time.sleep(wait)
+    except _Stop:
+        log("получен SIGTERM — сливаю WAL и закрываю БД")
+    finally:
         try:
-            run_poll(feeds, con)
-        except KeyboardInterrupt:
-            raise
+            con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         except Exception:
-            log("ошибка опроса:\n" + traceback.format_exc())
-        if args.once:
-            break
-        wait = args.poll - (time.time() - t0)
-        if wait > 0:
-            time.sleep(wait)
-    con.close()
+            pass
+        con.close()
 
 
 if __name__ == "__main__":
