@@ -1,0 +1,95 @@
+name: collector
+
+# Круглосуточный сбор: 4 окна в сутки по ~5.5 часов (лимит GitHub — 6 часов на job).
+# Каждый запуск скачивает накопленную базу с сервера проекта, продолжает её пополнять, отправляет обратно —
+# так статистика не сбрасывается между окнами. Подробности — в README.md этого репозитория.
+
+on:
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: Сколько минут собирать (по умолчанию 330 = 5.5 часа)
+        default: "330"
+  schedule:
+    - cron: "5 0 * * *"
+    - cron: "5 6 * * *"
+    - cron: "5 12 * * *"
+    - cron: "5 18 * * *"
+
+concurrency:
+  group: collector
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Где мы сейчас
+        run: curl -s https://ipinfo.io/json | head -c 200; echo
+
+      - name: Ключи
+        working-directory: emu
+        run: |
+          printf 'SX_API_KEY=%s\n' "${{ secrets.SX_API_KEY }}" > .env
+          printf 'CLOUDBET_API_KEY=%s\n' "${{ secrets.CLOUDBET_API_KEY }}" >> .env
+
+      - name: Продолжить накопленную базу (если есть)
+        working-directory: emu
+        run: |
+          mkdir -p state
+          code=$(curl -s -o state/live.db -w '%{http_code}' \
+            -H "X-Upload-Token: ${{ secrets.UPLOAD_TOKEN }}" \
+            "${{ secrets.INGEST_URL }}/download/runner-db" || echo 000)
+          echo "скачивание базы: HTTP $code"
+          if [ "$code" != "200" ]; then rm -f state/live.db; echo "начинаем с чистой базы"; fi
+          ls -la state/ || true
+
+      - name: Сбор
+        working-directory: emu
+        env:
+          PYTHONIOENCODING: utf-8
+          NETFIX: "0"
+        run: |
+          MIN="${{ github.event.inputs.minutes || '330' }}"
+          timeout $((MIN * 60)) python live_poller.py --poll 15 --hours-ahead 6 --hours-back 2.5 \
+            --sources pinnacle,sx,smarkets,cloudbet || true
+          echo "--- последние строки лога:"
+          tail -8 state/poller.log 2>/dev/null || true
+
+      - name: Отправить базу обратно на сервер
+        working-directory: emu
+        if: always()
+        run: |
+          if [ -f state/live.db ]; then
+            code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+              -H "X-Upload-Token: ${{ secrets.UPLOAD_TOKEN }}" \
+              --data-binary @state/live.db \
+              "${{ secrets.INGEST_URL }}/upload/runner-db")
+            echo "отправка базы: HTTP $code"
+          fi
+
+      - name: Отчёт по окну
+        if: always()
+        working-directory: emu
+        env:
+          PYTHONIOENCODING: utf-8
+        run: |
+          mkdir -p ../reports
+          python report_live.py --since "$(date -u +%Y-%m-%d)" --md "../reports/$(date -u +%Y-%m-%d-%H%M).md" || true
+
+      - name: Сохранить отчёт в репозиторий
+        if: always()
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add reports || true
+          git commit -m "Окно сбора $(date -u +%F\ %H:%M) UTC" || echo "нечего коммитить"
+          git pull --rebase --autostash || true
+          git push || true

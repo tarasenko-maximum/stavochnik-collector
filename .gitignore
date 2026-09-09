@@ -1,0 +1,7 @@
+.env
+emu/state/*.db
+emu/state/*.db-wal
+emu/state/*.db-shm
+emu/state/*.log
+__pycache__/
+*.pyc
