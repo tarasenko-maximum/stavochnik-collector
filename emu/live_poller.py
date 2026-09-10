@@ -207,26 +207,22 @@ def run_poll(feeds: Feeds, con):
     pin = _run("pinnacle", feeds.pinnacle)
     feeds.errors["skew_s"] = round(max(done_ts.values()) - min(done_ts.values()), 1) if len(done_ts) > 1 else 0
     n_src = {"pinnacle": len(pin), "sx": len(sx), "smarkets": len(sm), "cloudbet": len(cb)}
-    # опорный источник — букмекер (Pinnacle, иначе Cloudbet); если букмекеров нет — SX
-    if pin:
-        base, others = pin, {"sx": sx, "smarkets": sm, "cloudbet": cb}
-    elif cb:
-        base, others = cb, {"sx": sx, "smarkets": sm}
-    else:
-        base, others = sx, {"smarkets": sm}
-    others = {k: v for k, v in others.items() if v}
-    if others:
-        groups = oc.match_fixtures(base, others)
-    else:
-        # один источник (напр. только SX на сервере до ключа Cloudbet): пары нет, но тики пишем —
-        # это даёт статистику глубины стакана по ночным рынкам и внутрибиржевые вилки (EX)
-        groups = [{"base": f, "scores": {}} for f in base]
+    # N-сторонний матчинг (без единого анкора) — см. odds_common.match_all: раньше матч целиком
+    # выпадал из сопоставления, если его не было у «опорного» источника (обычно Cloudbet на
+    # сервере), даже когда SX/Smarkets по нему давали полные живые котировки.
+    groups = oc.match_all({"pinnacle": pin, "sx": sx, "smarkets": sm, "cloudbet": cb})
     open_eps = ldb.open_episodes(con)
     seen_eps = set()
     n_arbs = n_pos = n_live = 0
     poll_id = ldb.insert_poll(con, ts, 0, n_src, len(groups), 0, 0, 0, feeds.errors)
     for g in groups:
-        gkey = g["base"].key()
+        # ключ группы — по именам команд, НЕ по source:id опорной фикстуры: раньше matching был
+        # жёстко привязан к одному анкору, и gkey=base.key() был стабилен автоматически. Теперь
+        # анкор в match_all может меняться от опроса к опросу (см. odds_common.match_all) — если
+        # ключ группы будет зависеть от того, чья фикстура попала в "base" в конкретном опросе,
+        # каждая смена анкора будет обрываться серию эпизода и открывать новую «группу» для того
+        # же реального матча. Имя команд — единственное, что не меняется между источниками.
+        gkey = f"pair:{oc.norm_name(g['base'].home)}|{oc.norm_name(g['base'].away)}"
         is_live = any(f.is_live for k, f in g.items() if k not in ("base", "scores")) or g["base"].is_live
         n_live += int(is_live)
         ldb.upsert_group(con, gkey, g, ts)

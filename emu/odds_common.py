@@ -209,6 +209,48 @@ def match_fixtures(base: list, others: dict, threshold=0.72, margin=0.08):
     return groups
 
 
+def match_all(sources: dict, threshold=0.72, margin=0.08):
+    """N-сторонний матчинг без единого «опорного» источника.
+
+    Раньше матчинг всегда шёл от одного анкора (обычно Cloudbet на сервере): если у анкора матч
+    выпадал из выдачи — например, Cloudbet отключил основной рынок в live прямо в момент старта
+    матча (проверено 10.09.2026 на Fenerbahce–Roma, УЕФА Лига чемпионов), — матч целиком исчезал из
+    сопоставления, даже если у SX.bet или Smarkets по нему были полные живые котировки.
+
+    Здесь на каждом раунде анкором становится крупнейший из ещё непристроенных источников; то, что
+    он матчит, уходит из пула, остаток идёт на следующий раунд с новым анкором. Так пара источников
+    находит друг друга, даже если третий (обычно самый богатый) в моменте недоступен по конкретному
+    матчу. sources: {"pinnacle": [...], "cloudbet": [...], ...} — списки Fixture."""
+    remaining = {name: list(lst) for name, lst in sources.items() if lst}
+    groups = []
+    while remaining:
+        anchor_name = max(remaining, key=lambda k: len(remaining[k]))
+        anchor_list = remaining.pop(anchor_name)
+        if not remaining:
+            for f in anchor_list:
+                groups.append({"base": f, "scores": {}})
+            break
+        gs = match_fixtures(anchor_list, remaining, threshold=threshold, margin=margin)
+        matched_anchor_keys = {g["base"].key() for g in gs}
+        for f in anchor_list:
+            if f.key() not in matched_anchor_keys:
+                # ни у одного из оставшихся источников пары не нашлось (например, рынок отключён
+                # именно там) — вилку не построить, но тик стоит записать: даёт видимость на
+                # табло и статистику покрытия, не отбрасывать молча
+                groups.append({"base": f, "scores": {}})
+        matched_ids = {name: set() for name in remaining}
+        for g in gs:
+            groups.append(g)
+            for src in remaining:
+                if src in g:
+                    matched_ids[src].add(g[src].key())
+        for src in list(remaining):
+            remaining[src] = [f for f in remaining[src] if f.key() not in matched_ids[src]]
+            if not remaining[src]:
+                del remaining[src]
+    return groups
+
+
 def now_ts():
     return int(time.time())
 
