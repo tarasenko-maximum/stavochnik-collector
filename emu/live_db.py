@@ -138,6 +138,26 @@ def close_episodes(con, ids):
         con.executemany("UPDATE episodes SET closed=1 WHERE id=?", [(i,) for i in ids])
 
 
+def already_traded_recently(con, gkey, akey, before_ts, window_hours=24):
+    """Была ли УЖЕ виртуальная сделка по этой ровно вилке (gkey+akey) в окне
+    [before_ts−window_hours, before_ts) — независимо от episode_id. `before_ts` — момент начала
+    ТЕКУЩЕГО эпизода (для новых эпизодов это ts опроса, для продолжающихся — их собственный
+    first_ts): так проверка не видит сделки, которые сам этот эпизод уже вставил на delay 0/30/60
+    (у них ts ≥ first_ts эпизода), но видит сделки от ПРЕДЫДУЩЕГО, уже закрытого эпизода той же
+    вилки.
+
+    Без этой проверки одна и та же возможность, которая на секунду пропадает из опроса и тут же
+    появляется снова (обрыв данных источника, а не реальное закрытие вилки), открывает НОВЫЙ
+    episode_id и эмулятор «переставляется» заново — иногда десятки раз в день на одном и том же
+    матче, раздувая «гарантированную прибыль» далеко за пределы того, что реальный трейдер получил
+    бы, войдя в позицию один раз. Обнаружено 10.09.2026: 51 сделка за день, из них ~40 — повторный
+    вход в один и тот же Fenerbahce–Roma."""
+    since_ts = before_ts - window_hours * 3600
+    r = con.execute("SELECT 1 FROM vtrades WHERE gkey=? AND akey=? AND ts>=? AND ts<? LIMIT 1",
+                    (gkey, akey, since_ts, before_ts)).fetchone()
+    return r is not None
+
+
 def insert_vtrade(con, episode_id, delay, ts, gkey, a, is_live, stake, profit, tied):
     con.execute("""INSERT OR IGNORE INTO vtrades(episode_id,delay_s,ts,gkey,akey,kind,mtype,sel,sources,is_live,edge,stake,profit,tied,legs)
                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",

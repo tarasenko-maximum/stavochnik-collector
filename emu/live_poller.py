@@ -251,6 +251,12 @@ def run_poll(feeds: Feeds, con):
             seen_eps.add(ek)
             if ep is None:
                 open_eps[ek] = {"id": ep_id, "first_ts": ts}
+            # реальный трейдер входит в позицию один раз, а не при каждом секундном обрыве данных
+            # источника — проверяем по времени начала ЭТОГО эпизода (не по памяти процесса: open_eps
+            # грузится из БД заново каждый опрос, in-memory флаг между опросами не переживёт)
+            episode_start = ep["first_ts"] if ep else ts
+            if ldb.already_traded_recently(con, gkey, a.key(), episode_start):
+                continue
             for d in DELAYS:
                 if age >= d:
                     ldb.insert_vtrade(con, ep_id, d, ts, gkey, a, is_live, a.cap, a.profit_at_cap, a.tied)
