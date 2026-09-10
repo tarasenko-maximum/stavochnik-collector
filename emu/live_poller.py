@@ -159,11 +159,30 @@ def quotes_json(g):
     return out
 
 
+RETENTION_HOURS = 30     # держим «сегодня» + запас на смену суток; старше — не нужно ни дашборду
+                          # (все запросы фильтруют по day_start), ни отчёту
+PRUNE_EVERY_POLLS = 80   # раз в ~20 мин при шаге 15 с
 MAX_SKEW_S = 20          # макс. разница времени снимков источников, при которой вилка засчитывается
 LIVE_EXCLUDE_MTYPES = {"ah"}   # в live у бука и бирж разная база гандикапа (от 0:0 vs от текущего счёта) — не сравниваем
 # Проверено 06.09.2026: гостевой API Pinnacle в live НЕ обновляет цены (версии/кэфы заморожены минутами,
 # Франкфурт–Аугсбург 1:2 на 90' — away 1.66). В live Pinnacle из расчёта вилок исключаем (тики пишем).
 LIVE_STALE_SOURCES = {"pinnacle"}
+
+
+def prune_old(con, poll_id):
+    """Раз в ~20 мин удаляет тики и записи вилок старше RETENTION_HOURS + сжимает файл VACUUM'ом.
+    Без этого `ticks` (полные JSON-снимки котировок каждого опроса) растёт неограниченно — на 4
+    источниках это ≈6 МБ/час, и выгружаемая коллектором база за сутки перевалила бы за 100+ МБ
+    (обнаружено 10.09: за 16.5 ч набежало 99 МБ, из них 57 МБ — один только `ticks`)."""
+    if poll_id % PRUNE_EVERY_POLLS != 0:
+        return
+    cutoff = int(time.time()) - RETENTION_HOURS * 3600
+    d1 = con.execute("DELETE FROM ticks WHERE ts<?", (cutoff,)).rowcount
+    d2 = con.execute("DELETE FROM arbs WHERE ts<?", (cutoff,)).rowcount
+    con.commit()
+    if d1 or d2:
+        con.execute("VACUUM")
+        log(f"обрезка (>{RETENTION_HOURS} ч): ticks -{d1}, arbs -{d2}, база сжата VACUUM")
 
 
 def run_poll(feeds: Feeds, con):
@@ -247,6 +266,7 @@ def run_poll(feeds: Feeds, con):
     con.commit()
     log(f"poll #{poll_id}: pin {len(pin)} cb {len(cb)} sx {len(sx)} sm {len(sm)} | групп {len(groups)} (live {n_live}) | "
         f"записей {n_arbs}, вилок>0 {n_pos} | {dur:.0f}s" + (f" | ошибки {feeds.errors}" if feeds.errors else ""))
+    prune_old(con, poll_id)
     try:
         import dashboard_export
         dashboard_export.write_and_push(push=True)
