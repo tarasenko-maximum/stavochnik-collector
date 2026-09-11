@@ -58,8 +58,17 @@ jobs:
           NETFIX: "0"
         run: |
           MIN="${{ github.event.inputs.minutes || '330' }}"
+          # каждые 20 минут — снимок базы на сервер, чтобы сделки попадали в уикенд-тест банкролла
+          # без ожидания конца окна (снимок через sqlite backup — согласованная копия WAL-базы)
+          ( while sleep 1200; do
+              python -c "import sqlite3;s=sqlite3.connect('state/live.db');d=sqlite3.connect('state/snap.db');s.backup(d);d.close();s.close()" \
+              && curl -s -o /dev/null -w 'промежуточная отправка базы: HTTP %{http_code}\n' -X POST \
+                   -H "X-Upload-Token: ${{ secrets.UPLOAD_TOKEN }}" --data-binary @state/snap.db \
+                   "${{ secrets.INGEST_URL }}/upload/runner-db" || true
+            done ) &
           timeout $((MIN * 60)) python live_poller.py --poll 15 --hours-ahead 6 --hours-back 2.5 \
             --sources pinnacle,sx,smarkets,cloudbet || true
+          kill %1 2>/dev/null || true
           echo "--- последние строки лога:"
           tail -8 state/poller.log 2>/dev/null || true
 
