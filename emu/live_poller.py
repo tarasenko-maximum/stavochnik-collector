@@ -64,10 +64,14 @@ def keep_awake():
         return False
 
 
+SPORTS_DEFAULT = ("football", "amfootball", "baseball", "basketball", "hockey")
+
+
 class Feeds:
-    def __init__(self, hours_back, hours_ahead, sources=("pinnacle", "sx", "smarkets", "cloudbet")):
+    def __init__(self, hours_back, hours_ahead, sources=("pinnacle", "sx", "smarkets", "cloudbet"), sports=SPORTS_DEFAULT):
         self.hours_back, self.hours_ahead = hours_back, hours_ahead
         self.sources = set(sources)
+        self.sports = tuple(sports)
         self.sx_fx, self.sx_ts = {}, 0
         self.sm_cache, self.sm_fx, self.sm_ts = {}, {}, 0
         self.errors = {}
@@ -80,8 +84,15 @@ class Feeds:
         if "pinnacle" not in self.sources or pinnacle_client is None:
             return []
         try:
-            fx = pinnacle_client.fetch_soccer(primary_only=True)
-            return [f for f in fx.values() if self.window(f)]
+            out = []
+            for sp in self.sports:
+                try:
+                    fx = pinnacle_client.fetch_sport(sp, primary_only=True)
+                except Exception as e:
+                    self.errors[f"pinnacle:{sp}"] = str(e)[:120]
+                    continue
+                out += [f for f in fx.values() if self.window(f)]
+            return out
         except Exception as e:
             self.errors["pinnacle"] = str(e)[:200]
             return []
@@ -91,7 +102,13 @@ class Feeds:
             return []
         try:
             if time.time() - self.sx_ts > SX_REFRESH_MARKETS_SEC or not self.sx_fx:
-                self.sx_fx = sx_client.fetch_soccer(types=(1, 2, 3))
+                fx = {}
+                for sp in self.sports:
+                    try:
+                        fx.update({f"{sp}:{k}": v for k, v in sx_client.fetch_sport(sp).items()})
+                    except Exception as e:
+                        self.errors[f"sx:{sp}"] = str(e)[:120]
+                self.sx_fx = fx
                 self.sx_ts = time.time()
             lst = [f for f in self.sx_fx.values() if self.window(f)]
             now = time.time()
@@ -111,8 +128,15 @@ class Feeds:
             return []
         try:
             import cloudbet_client
-            fx = cloudbet_client.fetch_soccer(self.hours_back, self.hours_ahead)
-            return [f for f in fx.values() if self.window(f)]
+            out = []
+            for sp in self.sports:
+                try:
+                    fx = cloudbet_client.fetch_sport(sp, self.hours_back, self.hours_ahead)
+                except Exception as e:
+                    self.errors[f"cloudbet:{sp}"] = str(e)[:120]
+                    continue
+                out += [f for f in fx.values() if self.window(f)]
+            return out
         except Exception as e:
             self.errors["cloudbet"] = str(e)[:200]
             return []
@@ -210,7 +234,12 @@ def run_poll(feeds: Feeds, con):
     # N-сторонний матчинг (без единого анкора) — см. odds_common.match_all: раньше матч целиком
     # выпадал из сопоставления, если его не было у «опорного» источника (обычно Cloudbet на
     # сервере), даже когда SX/Smarkets по нему давали полные живые котировки.
-    groups = oc.match_all({"pinnacle": pin, "sx": sx, "smarkets": sm, "cloudbet": cb})
+    # матчим внутри одного вида спорта — имена команд разных видов спорта не должны сшиваться между собой
+    groups = []
+    for sp in feeds.sports:
+        part = {k: [f for f in v if f.sport == sp] for k, v in (("pinnacle", pin), ("sx", sx), ("smarkets", sm), ("cloudbet", cb))}
+        if sum(len(v) for v in part.values()) >= 2:
+            groups += oc.match_all(part)
     open_eps = ldb.open_episodes(con)
     seen_eps = set()
     n_arbs = n_pos = n_live = 0
@@ -222,7 +251,8 @@ def run_poll(feeds: Feeds, con):
         # ключ группы будет зависеть от того, чья фикстура попала в "base" в конкретном опросе,
         # каждая смена анкора будет обрываться серию эпизода и открывать новую «группу» для того
         # же реального матча. Имя команд — единственное, что не меняется между источниками.
-        gkey = f"pair:{oc.norm_name(g['base'].home)}|{oc.norm_name(g['base'].away)}"
+        sp = g["base"].sport
+        gkey = f"pair:{'' if sp == 'football' else sp + ':'}{oc.norm_name(g['base'].home)}|{oc.norm_name(g['base'].away)}"
         is_live = any(f.is_live for k, f in g.items() if k not in ("base", "scores")) or g["base"].is_live
         n_live += int(is_live)
         ldb.upsert_group(con, gkey, g, ts)
@@ -299,11 +329,13 @@ def main():
     ap.add_argument("--poll", type=int, default=POLL_SEC)
     ap.add_argument("--hours-ahead", type=float, default=3.0)
     ap.add_argument("--hours-back", type=float, default=2.5)
+    ap.add_argument("--sports", default=",".join(SPORTS_DEFAULT), help="football,amfootball,baseball,basketball,hockey")
     ap.add_argument("--sources", default="pinnacle,sx,smarkets,cloudbet",
                     help="через запятую: pinnacle,sx,smarkets,cloudbet. На сервере Hetzner доступны только sx,cloudbet "
                          "(Pinnacle/Smarkets/Betfair дают 403 с дата-центра)")
     args = ap.parse_args()
-    feeds = Feeds(args.hours_back, args.hours_ahead, tuple(s.strip() for s in args.sources.split(",") if s.strip()))
+    feeds = Feeds(args.hours_back, args.hours_ahead, tuple(s.strip() for s in args.sources.split(",") if s.strip()),
+                  tuple(s.strip() for s in args.sports.split(",") if s.strip()))
     con = ldb.connect()
     # закрыть эпизоды прошлого запуска
     ldb.close_episodes(con, [v["id"] for v in ldb.open_episodes(con).values()])

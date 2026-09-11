@@ -78,6 +78,10 @@ def connect():
     con = sqlite3.connect(DB_PATH, timeout=30)
     con.execute("PRAGMA journal_mode=WAL")
     con.executescript(SCHEMA)
+    try:
+        con.execute("ALTER TABLE groups ADD COLUMN sport TEXT DEFAULT 'football'")
+    except sqlite3.OperationalError:
+        pass
     return con
 
 
@@ -89,10 +93,11 @@ def upsert_group(con, gkey, g, ts):
             continue
         members[src] = {"ext_id": f.ext_id, "home": f.home, "away": f.away, "score": g["scores"].get(src)}
     members[base.src] = {"ext_id": base.ext_id, "home": base.home, "away": base.away, "score": 1.0}
-    con.execute("""INSERT INTO groups(gkey,home,away,league,start_ts,members,first_ts,last_ts)
-                   VALUES(?,?,?,?,?,?,?,?)
-                   ON CONFLICT(gkey) DO UPDATE SET members=excluded.members, last_ts=excluded.last_ts""",
-                (gkey, base.home, base.away, base.league, base.start_ts, json.dumps(members, ensure_ascii=False), ts, ts))
+    con.execute("""INSERT INTO groups(gkey,home,away,league,start_ts,members,first_ts,last_ts,sport)
+                   VALUES(?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(gkey) DO UPDATE SET members=excluded.members, last_ts=excluded.last_ts, sport=excluded.sport""",
+                (gkey, base.home, base.away, base.league, base.start_ts, json.dumps(members, ensure_ascii=False), ts, ts,
+                 getattr(base, "sport", "football")))
 
 
 def insert_poll(con, ts, dur, n_src, n_groups, n_live, n_arbs, n_pos, errors):

@@ -22,6 +22,16 @@ from odds_common import Fixture, Market, Q, american_to_decimal
 BASE = "https://guest.api.arcadia.pinnacle.com/0.1"
 GUEST_KEY = "CmX2KcMrXuFmNg6YFbmTxE0y9CIrOi0R"
 SPORT_SOCCER = 29
+# sportId Pinnacle и какие типы рынков period 0 сравнимы с другими источниками (см. docs/SPORTS-PROBE.md):
+# у хоккея period 0 — только 2-way moneyline с ОТ и буллитами; спред/тотал основного времени лежат в period 6,
+# а у SX/Cloudbet линии идут с ОТ — их не сводим (ложные вилки).
+SPORTS = {
+    "football":   (29, ("moneyline", "total", "spread")),
+    "amfootball": (15, ("moneyline", "total", "spread")),
+    "baseball":   (3,  ("moneyline", "total", "spread")),
+    "basketball": (4,  ("moneyline", "total", "spread")),
+    "hockey":     (19, ("moneyline",)),
+}
 
 
 class PinnacleError(Exception):
@@ -63,10 +73,15 @@ def _ts(iso):
 
 
 def fetch_soccer(primary_only=False):
-    """Возвращает {matchupId: Fixture} по футболу с рынками 1x2 / total / ah (period 0)."""
-    matchups = _get(f"sports/{SPORT_SOCCER}/matchups", {"withSpecials": "false"})
+    return fetch_sport("football", primary_only)
+
+
+def fetch_sport(sport, primary_only=False):
+    """Возвращает {matchupId: Fixture} по виду спорта с рынками period 0 (moneyline → 1x2/12, total, spread → ah)."""
+    sport_id, allowed_types = SPORTS[sport]
+    matchups = _get(f"sports/{sport_id}/matchups", {"withSpecials": "false"})
     try:
-        live = _get(f"sports/{SPORT_SOCCER}/matchups/live")
+        live = _get(f"sports/{sport_id}/matchups/live")
     except PinnacleError:
         live = []
     live_ids = {m["id"] for m in live if m.get("type") == "matchup"}
@@ -74,7 +89,7 @@ def fetch_soccer(primary_only=False):
     matchups = list(matchups) + [m for m in live if m["id"] not in seen]
     # Проверено 06.09.2026 (Арсенал–Челси 2:1): актуальные live-цены лежат в общем /markets/straight
     # под id дочернего live-matchup; эндпоинт /markets/live/straight отдаёт устаревшие/иные цены — НЕ используем.
-    markets = _get(f"sports/{SPORT_SOCCER}/markets/straight",
+    markets = _get(f"sports/{sport_id}/markets/straight",
                    {"primaryOnly": "true"} if primary_only else None)
     # у одной игры может быть два live-matchup (live_delay и danger_zone) — оставляем один, предпочитая не danger_zone
     by_parent = {}
@@ -106,6 +121,8 @@ def fetch_soccer(primary_only=False):
         blob = (league_name + " " + " ".join(p.get("name") or "" for p in parts)).lower()
         if any(w in blob for w in ("corner", "booking", "cards", "(sets", "yellow", "offsides", "shots")):
             continue
+        if (m.get("units") or "") in ("Kills", "Games"):
+            continue
         home = next((p.get("name") for p in parts if p.get("alignment") == "home"), None)
         away = next((p.get("name") for p in parts if p.get("alignment") == "away"), None)
         if not home or not away:
@@ -115,7 +132,7 @@ def fetch_soccer(primary_only=False):
                 continue
         fx[m["id"]] = Fixture(
             src="pinnacle", ext_id=str(m["id"]), home=home, away=away,
-            league=league_name,
+            league=league_name, sport=sport,
             start_ts=_ts(m.get("startTime") or ""),
             is_live=bool(m.get("isLive")) or m["id"] in live_ids,
             raw={"liveMode": m.get("liveMode"), "status": m.get("status"),
@@ -134,6 +151,8 @@ def fetch_soccer(primary_only=False):
             if l.get("type") == "maxRiskStake":
                 lim = float(l.get("amount") or 0)
         t = mk.get("type")
+        if t not in allowed_types:
+            continue
         prices = mk.get("prices") or []
         if t == "moneyline":
             sels = {}

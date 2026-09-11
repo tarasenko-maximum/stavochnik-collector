@@ -43,6 +43,16 @@ FOOTBALL = "soccer"
 M_1X2 = "soccer.match_odds"
 M_TOTAL = "soccer.total_goals"
 M_AH = "soccer.asian_handicap"
+# Вид спорта → ключ Cloudbet, ключи рынков (победитель, тотал, гандикап) и какой субмаркет брать:
+# "ft" — основное время (футбол), "ot" — с овертаймом (у американских видов спорта и хоккея так же
+# считают Pinnacle period 0 и SX 226/342/28). См. docs/SPORTS-PROBE.md.
+SPORTS = {
+    "football":   ("soccer", M_1X2, M_TOTAL, M_AH, "ft"),
+    "amfootball": ("american-football", "american_football.moneyline", "american_football.totals", "american_football.handicap", "ot"),
+    "baseball":   ("baseball", "baseball.moneyline", "baseball.totals", "baseball.run_line", "ot"),
+    "basketball": ("basketball", "basketball.moneyline", "basketball.totals", "basketball.handicap", "ot"),
+    "hockey":     ("ice-hockey", "ice_hockey.winner", "ice_hockey.totals", "ice_hockey.handicap", "ot"),
+}
 MARKETS = f"{M_1X2},{M_TOTAL},{M_AH}"
 LAST_REQ = 0.0
 MIN_INTERVAL = 0.25
@@ -114,15 +124,16 @@ def _param(s, name):
     return None
 
 
-def _submarket(market):
-    """Субмаркет основного времени (ключ без 'ot'); при отсутствии — первый попавшийся."""
+def _submarket(market, period="ft"):
+    """period='ft' — субмаркет основного времени (ключ без 'ot'); 'ot' — с овертаймом (ключ содержит 'ot').
+    Если нужного нет — None: смешивать правила расчёта нельзя."""
     subs = (market or {}).get("submarkets") or {}
     if not isinstance(subs, dict):
         return None
     for k, v in subs.items():
-        if "ot" not in k:
+        if ("ot" in k) == (period == "ot"):
             return v
-    return next(iter(subs.values()), None)
+    return None
 
 
 def _enabled(sel):
@@ -134,21 +145,22 @@ def _enabled(sel):
     return price > 1.0 and sel.get("status") in (None, "SELECTION_ENABLED")
 
 
-def parse_event(ev, league=""):
-    """Событие Cloudbet → Fixture с рынками 1x2 / total / ah."""
+def parse_event(ev, league="", sport="football"):
+    """Событие Cloudbet → Fixture с рынками 1x2|12 / total / ah по правилам вида спорта."""
+    _key, m_win, m_total, m_ah, period = SPORTS[sport]
     home = (ev.get("home") or {}).get("name") or ""
     away = (ev.get("away") or {}).get("name") or ""
     status = ev.get("status") or ""
     # у live-событий startTime может отсутствовать — берём cutoffTime как ориентир
     start = _ts(ev.get("startTime")) or _ts(ev.get("cutoffTime"))
     f = Fixture(src="cloudbet", ext_id=str(ev.get("id")), home=home, away=away,
-                league=league,
+                league=league, sport=sport,
                 start_ts=start,
                 is_live=status in ("TRADING_LIVE", "LIVE"),
                 raw={"status": status, "cutoff": ev.get("cutoffTime")})
     markets = ev.get("markets") or {}
 
-    sm = _submarket(markets.get(M_1X2))
+    sm = _submarket(markets.get(m_win), period)
     if sm:
         sels = {}
         for s in sm.get("selections") or []:
@@ -158,9 +170,11 @@ def parse_event(ev, league=""):
             if o in ("home", "draw", "away") and _enabled(s):
                 sels[o] = Q(back=float(s["price"]), back_size=float(s.get("maxStake") or 0))
         if len(sels) == 3:
-            f.markets[("1x2", None)] = Market(sels=sels, ext={"market": M_1X2})
+            f.markets[("1x2", None)] = Market(sels=sels, ext={"market": m_win})
+        elif len(sels) == 2 and "draw" not in sels:
+            f.markets[("12", None)] = Market(sels=sels, ext={"market": m_win})
 
-    sm = _submarket(markets.get(M_TOTAL))
+    sm = _submarket(markets.get(m_total), period)
     if sm:
         by_line = {}
         for s in sm.get("selections") or []:
@@ -171,9 +185,9 @@ def parse_event(ev, league=""):
             by_line.setdefault(line, {})[o] = Q(back=float(s["price"]), back_size=float(s.get("maxStake") or 0))
         for line, sels in by_line.items():
             if len(sels) == 2:
-                f.markets[("total", line)] = Market(sels=sels, ext={"market": M_TOTAL, "main": False})
+                f.markets[("total", line)] = Market(sels=sels, ext={"market": m_total, "main": False})
 
-    sm = _submarket(markets.get(M_AH))
+    sm = _submarket(markets.get(m_ah), period)
     if sm:
         by_line = {}
         for s in sm.get("selections") or []:
@@ -185,20 +199,25 @@ def parse_event(ev, league=""):
             by_line.setdefault(line, {})[o] = Q(back=float(s["price"]), back_size=float(s.get("maxStake") or 0))
         for line, sels in by_line.items():
             if len(sels) == 2:
-                f.markets[("ah", line)] = Market(sels=sels, ext={"market": M_AH, "main": False})
+                f.markets[("ah", line)] = Market(sels=sels, ext={"market": m_ah, "main": False})
     return f
 
 
 def fetch_soccer(hours_back=2, hours_ahead=6):
-    """Футбольные события окна + live. Возвращает {ext_id: Fixture}.
+    return fetch_sport("football", hours_back, hours_ahead)
+
+
+def fetch_sport(sport, hours_back=2, hours_ahead=6):
+    """События вида спорта в окне + live. Возвращает {ext_id: Fixture}.
     Ответ приходит как {"competitions": [{name, events: [...]}]} — разворачиваем."""
+    sport_key = SPORTS[sport][0]
     now = int(time.time())
     out = {}
     # ⚠ Параметр `markets=` НЕ передаём: проверено 08.09.2026 — с ним API возвращает те же события,
     # но все selections приходят как SELECTION_DISABLED с price=0. Фильтруем рынки на своей стороне.
     for params in (
-        {"sport": FOOTBALL, "live": "true"},
-        {"sport": FOOTBALL, "from": now - int(hours_back * 3600), "to": now + int(hours_ahead * 3600),
+        {"sport": sport_key, "live": "true"},
+        {"sport": sport_key, "from": now - int(hours_back * 3600), "to": now + int(hours_ahead * 3600),
          "limit": 500},
     ):
         try:
@@ -211,7 +230,7 @@ def fetch_soccer(hours_back=2, hours_ahead=6):
         for comp in d.get("competitions") or []:
             league = comp.get("name") or ""
             for ev in comp.get("events") or []:
-                f = parse_event(ev, league)
+                f = parse_event(ev, league, sport)
                 if not f.markets:
                     continue
                 prev = out.get(f.ext_id)

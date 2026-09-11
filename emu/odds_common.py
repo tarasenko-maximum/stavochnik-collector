@@ -51,6 +51,7 @@ class Fixture:
     fee: float = 0.0              # комиссия биржи с прибыли (0.01 = 1 %)
     markets: dict = field(default_factory=dict)  # mkey -> Market
     raw: dict = field(default_factory=dict)
+    sport: str = "football"        # football | amfootball | baseball | basketball | hockey
 
     def key(self):
         return f"{self.src}:{self.ext_id}"

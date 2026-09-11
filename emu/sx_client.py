@@ -37,7 +37,10 @@ FEE_TAKER = 0.01
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) stavochnik-emu/0.2"
 API_KEY = os.environ.get("SX_API_KEY", "")
 SPORT_SOCCER = 5
-TYPES = {1: "1x2", 2: "total", 3: "ah", 52: "12"}
+# У SX овертайм зашит в тип рынка: 226 — победитель с ОТ, 342 — гандикап с ОТ, 28 — тотал с ОТ (см. docs/SPORTS-PROBE.md)
+TYPES = {1: "1x2", 2: "total", 3: "ah", 52: "12", 226: "12", 342: "ah", 28: "total"}
+SPORTS = {"football": (5, (1, 2, 3)), "amfootball": (8, (226, 342, 28)), "baseball": (3, (226, 342, 28)),
+          "basketball": (1, (226, 342, 28)), "hockey": (2, (226, 342, 28))}
 
 
 class SxError(Exception):
@@ -79,13 +82,13 @@ def size_to_usdc(size_str):
 
 # ── рынки ────────────────────────────────────────────────────────────────────
 
-def list_markets(types=(1, 2, 3), page_size=100, max_pages=60):
-    """Все активные футбольные рынки заданных типов. Возвращает список сырых dict."""
+def list_markets(types=(1, 2, 3), page_size=100, max_pages=60, sport_id=SPORT_SOCCER):
+    """Все активные рынки вида спорта заданных типов. Возвращает список сырых dict."""
     rows = []
     for t in types:
         key = None
         for _ in range(max_pages):
-            params = {"sportIds": str(SPORT_SOCCER), "type": str(t), "pageSize": str(page_size)}
+            params = {"sportIds": str(sport_id), "type": str(t), "pageSize": str(page_size)}
             if key:
                 params["paginationKey"] = key
             d = _get("markets/active", params)
@@ -98,7 +101,7 @@ def list_markets(types=(1, 2, 3), page_size=100, max_pages=60):
     return rows
 
 
-def build_fixtures(rows):
+def build_fixtures(rows, sport="football"):
     """Сырые рынки → {sportXeventId: Fixture} с рынками (без цен). В Market.ext:
     legs = {sel: (marketHash, side)} где side ∈ {"one","two"} — на какой стороне рынка стоит sel."""
     fx = {}
@@ -114,7 +117,7 @@ def build_fixtures(rows):
         if f is None:
             f = Fixture(src="sx", ext_id=str(eid), home=m.get("teamOneName") or "",
                         away=m.get("teamTwoName") or "", league=m.get("leagueLabel") or "",
-                        start_ts=int(m.get("gameTime") or 0), is_exchange=True, fee=FEE_TAKER,
+                        start_ts=int(m.get("gameTime") or 0), is_exchange=True, fee=FEE_TAKER, sport=sport,
                         raw={"league_id": m.get("leagueId"), "live_enabled": m.get("liveEnabled")})
             fx[eid] = f
         score = m.get("teamOneScore")
@@ -314,8 +317,13 @@ def _refresh_by_event(fixtures, workers=8, only_main=True):
 
 
 def fetch_soccer(types=(1, 2, 3), with_prices=False):
-    rows = list_markets(types)
-    fx = build_fixtures(rows)
+    return fetch_sport("football", with_prices)
+
+
+def fetch_sport(sport, with_prices=False):
+    sport_id, types = SPORTS[sport]
+    rows = list_markets(types, sport_id=sport_id)
+    fx = build_fixtures(rows, sport)
     _mark_live_flags(rows, fx)
     if with_prices:
         refresh_prices(list(fx.values()))
